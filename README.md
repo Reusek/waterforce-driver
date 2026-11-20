@@ -64,18 +64,22 @@ CachyOS / Arch:
 ```sh
 sudo pacman -S --needed dkms base-devel linux-cachyos-headers   # headers for your kernel
 sudo pacman -S --needed clang llvm lld   # CachyOS kernels are built with clang; the Makefile detects it
-sudo mkdir -p /usr/src/gigabyte_waterforce-1.3.0
-sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.3.0/
-sudo dkms install gigabyte_waterforce/1.3.0
 
-# swap the running module for the new one (or just reboot)
-sudo modprobe -r gigabyte_waterforce && sudo modprobe gigabyte_waterforce
-cat /sys/module/gigabyte_waterforce/version   # should print 1.3.0-control
+make install
 ```
 
+`make install`:
+
+1. removes every version already installed through DKMS (`dkms status` lists them),
+2. installs this version with DKMS, which rebuilds it automatically for new kernels,
+3. reloads the driver and restarts CoolerControl if it is running.
+
+Run it again after pulling a new version. It asks for the sudo password.
+Check what is running with `cat /sys/module/gigabyte_waterforce/version`.
+
+`make uninstall` removes it again and goes back to the stock read-only driver.
+
 DKMS installs into `updates/`, which takes priority over the in-kernel module.
-If an older version was installed, remove it first, for example
-`sudo dkms remove gigabyte_waterforce/1.1.0 --all` (`dkms status` lists them).
 
 ### Quick test without installing
 
