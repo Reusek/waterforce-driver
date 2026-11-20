@@ -10,32 +10,47 @@ It keeps the same module name (`gigabyte_waterforce`) and hwmon name
 (`waterforce`), so CoolerControl and `sensors` see the same device as
 before. The difference is that Fan speed and Pump speed can now be controlled.
 
-> ⚠️ The control commands are community reverse-engineered, not documented by
-> Gigabyte. The fixed-speed command comes from Aleksa Savic's original WIP driver
-> and the profile command from
-> [omarchy-aorus-fan](https://github.com/D05Col/omarchy-aorus-fan), which was
-> measured on an X360. Watch temperatures the first time you use it.
+## How control works
 
-## What it adds
+The cooler has no working "set exact speed" command. The fixed-RPM command
+(`0xE6`) used by earlier drivers is ignored by the firmware. Testing on an X360
+showed that neither the pump nor the fan reacted to it.
 
-| sysfs file | Access | Meaning |
+What does work is choosing one of the cooler's **built-in profiles** (commands
+`0xE5` + `0xB6`, from
+[omarchy-aorus-fan](https://github.com/D05Col/omarchy-aorus-fan)):
+
+| Channel | Profile | Duty at idle | `pwm` range that selects it |
+|---|---|---|---|
+| Fan | quiet | ~56 % | 0–143 |
+| Fan | balance | ~72 % | 144–184 |
+| Fan | performance | ~88 % | 185–224 |
+| Fan | max | 100 % | 225–255 |
+| Pump | balance | ~81 % (~2670 RPM) | 0–207 |
+| Pump | max | 100 % (~3280 RPM) | 208–255 |
+
+When `pwmN` is written, the driver picks the **lowest profile that is at least
+as fast as the requested duty**, so the cooler never runs slower than asked.
+That makes the control steps coarse: 4 steps for the fan and 2 for the pump.
+The profiles are themselves temperature curves inside the cooler, so the real
+duty rises with coolant temperature.
+
+## sysfs files
+
+| File | Access | Meaning |
 |---|---|---|
-| `pwm1` / `pwm2` | rw | Fan / pump duty, 0–255. Writing sets a fixed speed and switches to manual mode |
-| `pwm1_enable` / `pwm2_enable` | rw | `1` = manual (fixed speed), `2` = cooler's own curve (the selected profile) |
-| `fan1_target` / `fan2_target` | rw | Fixed speed in RPM. Kept within 750 to `max_rpm`−1 |
-| `fan_profile` | rw | Firmware fan curve: `zero quiet balance default performance max` |
-| `pump_profile` | rw | Firmware pump curve: `balance max` |
+| `pwm1` / `pwm2` | rw | Read: duty the cooler reports. Write 0–255: picks a profile from the table above (manual mode) |
+| `pwm1_enable` / `pwm2_enable` | rw | `1` = manual (`pwmN` writes pick the profile), `2` = use the profile named in `fan_profile` / `pump_profile` |
+| `fan_profile` | rw | `zero quiet balance performance max default`, active one in `[brackets]` |
+| `pump_profile` | rw | `balance max` |
+
+`zero` (fan stop) and `default` (same as max on the tested unit) can only be
+chosen through `fan_profile`, never through `pwm1`. A profile is only sent when
+it changes, so the frequent `pwm` writes from CoolerControl do not keep sending
+commands to the cooler.
 
 The existing read-only files (`fan1_input`, `fan2_input`, `temp1_input`,
 labels) behave as before.
-
-Module parameters:
-
-* `max_rpm=2800`: the RPM that `pwm=255` maps to. The device takes back control
-  at 2800 RPM or more, so targets stay just below it.
-* `keepalive_ms=0`: if the cooler falls back to its own curve after a while,
-  set this to, for example, `5000` to re-send the manual target every 5 s. It
-  can be changed at runtime in `/sys/module/gigabyte_waterforce/parameters/keepalive_ms`.
 
 ## Install (DKMS, survives kernel updates)
 
@@ -44,37 +59,37 @@ CachyOS / Arch:
 ```sh
 sudo pacman -S --needed dkms base-devel linux-cachyos-headers   # headers for your kernel
 sudo pacman -S --needed clang llvm lld   # CachyOS kernels are built with clang; the Makefile detects it
-sudo mkdir -p /usr/src/gigabyte_waterforce-1.0.0
-sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.0.0/
-sudo dkms install gigabyte_waterforce/1.0.0
+sudo mkdir -p /usr/src/gigabyte_waterforce-1.1.0
+sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.1.0/
+sudo dkms install gigabyte_waterforce/1.1.0
 
 # swap the running module for the new one (or just reboot)
 sudo modprobe -r gigabyte_waterforce && sudo modprobe gigabyte_waterforce
-modinfo gigabyte_waterforce | grep version    # should print 1.0.0-control
+modinfo gigabyte_waterforce | grep version    # should print 1.1.0-control
 ```
 
 DKMS installs into `updates/`, which takes priority over the in-kernel module.
-
-To remove it: `sudo dkms remove gigabyte_waterforce/1.0.0 --all`. The stock
-driver comes back after a reboot or a `modprobe -r` / `modprobe`.
+If an older version was installed, remove it first with
+`sudo dkms remove gigabyte_waterforce/1.0.0 --all`.
 
 ### Quick test without installing
 
 ```sh
 make load      # builds, unloads the stock module, loads this one until reboot
+sudo ./test-pump.sh
 ```
+
+`make load` does not install anything. After a reboot the stock driver is back.
 
 ## Try it by hand
 
 ```sh
-cd /sys/class/hwmon/$(grep -l waterforce /sys/class/hwmon/*/name | xargs dirname | xargs basename)
+cd $(grep -l '^waterforce$' /sys/class/hwmon/*/name | xargs dirname)
 
-cat fan1_input fan2_input              # current RPM
-echo 1500 | sudo tee fan1_target       # fan fixed at ~1500 RPM
-echo 180  | sudo tee pwm2              # pump ~70 %
-echo 2    | sudo tee pwm1_enable       # fan back to the cooler's curve
-echo quiet | sudo tee fan_profile      # pick which curve that is
-cat fan_profile                        # zero [quiet] balance default performance max
+echo max     | sudo tee pump_profile   # pump to max
+echo quiet   | sudo tee fan_profile    # quiet fan curve
+echo 255     | sudo tee pwm2           # same as pump max, manual mode
+cat fan_profile                        # zero [quiet] balance performance max default
 ```
 
 Allow a couple of seconds after a change before reading `fanN_input`. The
@@ -83,20 +98,16 @@ reading is cached for 2 s.
 ## CoolerControl
 
 After the module is loaded, restart the daemon
-(`sudo systemctl restart coolercontrold`). Fan speed and Pump speed then show as
-controllable. Apply a profile (a fixed speed or a curve on CPU temperature).
-CoolerControl writes `pwmN`, which the driver turns into an RPM target.
+(`sudo systemctl restart coolercontrold`). Fan speed and Pump speed then show
+as controllable. A fixed speed or a curve works, but the result snaps to the
+profile steps in the table above. For example, any pump setting up to 81 % gives
+"balance" and anything above gives "max".
 
 ## Notes and known gaps
 
 * Only the first-generation X series (`1044:7a4d`) is supported. The WATERFORCE
   II (`1044:7a5e`) and the non-X models use a different protocol.
-* `pwmN` reads back the duty the cooler *reports*, so after a write it can differ
-  a little from what was written.
-* After a module load the driver reports `pwmN_enable = 2` and the `balance`
-  profiles. It cannot ask the device which profile is actually active.
-* One tool reported that the `0xE6` fixed-speed command can make the firmware
-  stick at about 88 %. If manual speeds don't take effect on this unit, use
-  `fan_profile` / `pump_profile` (the `0xE5` + `0xB6` commands), which are known
-  to work on the X360.
+* After a module load the driver assumes `balance` on both channels. It cannot
+  ask the device which profile is actually active. The first profile request is
+  always sent.
 * LCD and RGB are not handled here. Use userspace tools for them.
