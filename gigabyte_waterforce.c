@@ -5,10 +5,11 @@
  * Copyright 2023 Aleksa Savic <savicaleksa83@gmail.com>
  *
  * Out-of-tree fork that adds fan and pump control on top of the read-only
- * mainline driver. The device has no working fixed-speed command (0xE6 is
- * ignored by this firmware), so control works by selecting the firmware's
- * built-in profiles with 0xE5 and applying them with 0xB6. The profile codes
- * are from D05Col/omarchy-aorus-fan and were confirmed on an X360 (1044:7a4d).
+ * mainline driver. Everything below was confirmed on an X360 (1044:7a4d):
+ *  - 0xE5 <channel> <code> selects a firmware profile, 0xB6 applies it
+ *    (profile codes from D05Col/omarchy-aorus-fan, pump codes probed)
+ *  - 0xE6 writes the custom curve (from Aleksa Savic's WIP driver). It only
+ *    takes effect while the channel is in custom mode, profile code 0x01.
  */
 
 #include <linux/debugfs.h>
@@ -17,6 +18,7 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/jiffies.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
@@ -50,50 +52,90 @@ static const u8 get_firmware_ver_cmd[] = { 0x99, 0xD6 };
 #define SET_PROFILE_CMD		0xE5
 #define SET_PROFILE_FAN		0x01
 #define SET_PROFILE_PUMP	0x02
+#define PROFILE_CODE_CUSTOM	0x01	/* follow the 0xE6 custom curve */
 static const u8 commit_cmd[] = { 0x99, 0xB6 };
 #define CMD_GAP_MS		20
 
 /*
- * Firmware profiles. pwm is the duty the device reports while the profile is
- * active at idle coolant temperature (0-255), or 0 if a pwm write must never
- * pick it. A pwm write selects the fastest profile whose pwm does not exceed
- * the requested value, so the cooler never runs above what was asked for.
+ * Custom curve (0xE6): a big-endian RPM at each of curve_rpm_offsets[], with
+ * temperature markers in between (0x1E = 30, 0x32 = 50, 0x41 = 65 degrees C).
+ * The same RPM at every point gives a fixed speed.
+ */
+static const u8 set_curve_cmd_template[] = {
+	0x99, 0xE6, 0, 0, 0, 0, 0, 0x1E, 0, 0, 0x32, 0, 0, 0x41, 0, 0
+};
+
+#define SET_CURVE_CHANNEL_OFFSET	2
+static const u8 curve_channel[2][2] = {
+	{ 0x01, 0x01 },	/* Fan */
+	{ 0x04, 0x02 },	/* Pump */
+};
+static const u8 curve_rpm_offsets[] = { 5, 8, 11, 14 };
+
+/* The firmware is reported to leave custom mode at 2800 RPM or more */
+#define CURVE_RPM_LIMIT		2799
+
+/*
+ * Firmware profiles. Duty is what the device reported at 26 degrees C coolant;
+ * the profiles are curves, so it rises with coolant temperature.
  */
 struct waterforce_profile {
 	const char *name;
 	u8 code;
-	u8 pwm;
 };
 
 static const struct waterforce_profile fan_profiles[] = {
-	{ "zero", 0x07, 0 },		/* fan stop, only by explicit choice */
-	{ "quiet", 0x06, 143 },		/* ~56 % */
-	{ "balance", 0x00, 184 },	/* ~72 % */
-	{ "performance", 0x05, 224 },	/* ~88 % */
-	{ "max", 0x04, 255 },		/* 100 % */
-	{ "default", 0x02, 0 },		/* 100 % on tested unit, duplicate of max */
+	{ "zero", 0x07 },		/* fan stop */
+	{ "quiet", 0x06 },		/* ~56 % */
+	{ "balance", 0x00 },		/* ~72 % */
+	{ "performance", 0x05 },	/* ~88 % */
+	{ "max", 0x04 },		/* 100 % */
+	{ "default", 0x02 },		/* 100 % on tested unit */
 };
 
 static const struct waterforce_profile pump_profiles[] = {
-	{ "balance", 0x00, 207 },	/* ~81 %, ~2670 RPM */
-	{ "max", 0x04, 255 },		/* 100 %, ~3280 RPM */
+	{ "silent", 0x05 },		/* ~63 %, ~2100 RPM */
+	{ "quiet", 0x06 },		/* ~66 %, ~2140 RPM */
+	{ "balance", 0x00 },		/* ~81 %, ~2650 RPM */
+	{ "high", 0x02 },		/* ~93 %, ~2980 RPM */
+	{ "max", 0x04 },		/* 100 %, ~3250 RPM */
 };
 
 #define FAN_PROFILE_BALANCE	2
-#define PUMP_PROFILE_BALANCE	0
+#define FAN_PROFILE_MAX		4
+#define PUMP_PROFILE_BALANCE	2
+#define PUMP_PROFILE_MAX	4
+#define PROFILE_CUSTOM		0xFF	/* active_profile value for custom mode */
 
 static const struct {
 	const struct waterforce_profile *list;
 	int count;
 	u8 selector;
+	u8 max_idx;
 } channel_profiles[2] = {
-	{ fan_profiles, ARRAY_SIZE(fan_profiles), SET_PROFILE_FAN },
-	{ pump_profiles, ARRAY_SIZE(pump_profiles), SET_PROFILE_PUMP },
+	{ fan_profiles, ARRAY_SIZE(fan_profiles), SET_PROFILE_FAN, FAN_PROFILE_MAX },
+	{ pump_profiles, ARRAY_SIZE(pump_profiles), SET_PROFILE_PUMP, PUMP_PROFILE_MAX },
 };
 
 /* pwmN_enable values */
-#define PWM_MODE_MANUAL	1	/* pwmN writes pick the profile */
+#define PWM_MODE_MANUAL	1	/* pwmN / fanN_target set a fixed speed */
 #define PWM_MODE_AUTO	2	/* the profile chosen in fan_profile / pump_profile */
+
+static unsigned int fan_min_rpm = 750;
+module_param(fan_min_rpm, uint, 0644);
+MODULE_PARM_DESC(fan_min_rpm, "Lowest fan speed a manual setting may ask for (default 750)");
+
+static unsigned int fan_max_rpm = 2600;
+module_param(fan_max_rpm, uint, 0644);
+MODULE_PARM_DESC(fan_max_rpm, "Fan speed at pwm1 = 255 (default 2600)");
+
+static unsigned int pump_min_rpm = 1500;
+module_param(pump_min_rpm, uint, 0644);
+MODULE_PARM_DESC(pump_min_rpm, "Lowest pump speed a manual setting may ask for (default 1500)");
+
+static unsigned int pump_max_rpm = 3300;
+module_param(pump_max_rpm, uint, 0644);
+MODULE_PARM_DESC(pump_max_rpm, "Pump speed at pwm2 = 255 (default 3300)");
 
 static const char *const waterforce_temp_label[] = {
 	"Coolant temp"
@@ -126,7 +168,8 @@ struct waterforce_data {
 	struct mutex control_lock;
 	u8 pwm_mode[2];		/* PWM_MODE_MANUAL or PWM_MODE_AUTO */
 	u8 auto_profile[2];	/* Profile for PWM_MODE_AUTO, index into the list */
-	u8 active_profile[2];	/* Profile last sent to the device */
+	u8 active_profile[2];	/* Index of the profile last sent, or PROFILE_CUSTOM */
+	u16 target_rpm[2];	/* Fixed speed last sent while in custom mode */
 	bool profile_sent[2];	/* active_profile is known to be on the device */
 
 	u8 *buffer;
@@ -152,6 +195,8 @@ static umode_t waterforce_is_visible(const void *data,
 		case hwmon_fan_label:
 		case hwmon_fan_input:
 			return 0444;
+		case hwmon_fan_target:
+			return 0644;
 		default:
 			break;
 		}
@@ -226,18 +271,17 @@ unlock_and_return:
 	return 0;
 }
 
-/*
- * Select a firmware profile on one channel. Skipped if it is already active,
- * since tools such as CoolerControl rewrite pwm often. Caller holds control_lock.
- */
-static int waterforce_apply_profile(struct waterforce_data *priv, int channel, int idx)
+/* Invalidate cached status so the next read shows the effect of a command */
+static void waterforce_invalidate_status(struct waterforce_data *priv)
 {
-	u8 cmd[4] = { 0x99, SET_PROFILE_CMD, channel_profiles[channel].selector,
-		      channel_profiles[channel].list[idx].code };
-	int ret;
+	priv->updated = jiffies - msecs_to_jiffies(STATUS_VALIDITY);
+}
 
-	if (priv->profile_sent[channel] && priv->active_profile[channel] == idx)
-		return 0;
+/* Send 0xE5 <channel> <code> followed by the 0xB6 apply command */
+static int waterforce_send_profile_code(struct waterforce_data *priv, int channel, u8 code)
+{
+	u8 cmd[4] = { 0x99, SET_PROFILE_CMD, channel_profiles[channel].selector, code };
+	int ret;
 
 	ret = waterforce_write_expanded(priv, cmd, sizeof(cmd));
 	if (ret < 0)
@@ -245,38 +289,99 @@ static int waterforce_apply_profile(struct waterforce_data *priv, int channel, i
 
 	msleep(CMD_GAP_MS);
 
-	ret = waterforce_write_expanded(priv, commit_cmd, sizeof(commit_cmd));
+	return waterforce_write_expanded(priv, commit_cmd, sizeof(commit_cmd));
+}
+
+/*
+ * Select a firmware profile on one channel. Skipped if it is already active,
+ * since tools such as CoolerControl rewrite pwm often. Caller holds control_lock.
+ */
+static int waterforce_apply_profile(struct waterforce_data *priv, int channel, int idx)
+{
+	int ret;
+
+	if (priv->profile_sent[channel] && priv->active_profile[channel] == idx)
+		return 0;
+
+	ret = waterforce_send_profile_code(priv, channel,
+					   channel_profiles[channel].list[idx].code);
 	if (ret < 0)
 		return ret;
 
 	priv->active_profile[channel] = idx;
 	priv->profile_sent[channel] = true;
-	/* Invalidate cached status so the next read shows the new profile */
-	priv->updated = jiffies - msecs_to_jiffies(STATUS_VALIDITY);
+	waterforce_invalidate_status(priv);
 	return 0;
 }
 
 /*
- * Fastest pwm-selectable profile that does not exceed the requested duty.
- * Requests below the slowest profile get the slowest one.
+ * Run one channel at a fixed speed: write a flat custom curve, then switch the
+ * channel to custom mode. Skipped if that speed is already set. Caller holds
+ * control_lock.
  */
-static int waterforce_profile_for_pwm(int channel, long pwm)
+static int waterforce_apply_rpm(struct waterforce_data *priv, int channel, u16 rpm)
 {
-	const struct waterforce_profile *list = channel_profiles[channel].list;
-	int i, best = -1, lowest = -1;
+	u8 cmd[sizeof(set_curve_cmd_template)];
+	int i, ret;
 
-	for (i = 0; i < channel_profiles[channel].count; i++) {
-		if (!list[i].pwm)
-			continue;
-		if (lowest < 0 || list[i].pwm < list[lowest].pwm)
-			lowest = i;
-		if (list[i].pwm <= pwm && (best < 0 || list[i].pwm > list[best].pwm))
-			best = i;
-	}
+	if (priv->profile_sent[channel] && priv->active_profile[channel] == PROFILE_CUSTOM &&
+	    priv->target_rpm[channel] == rpm)
+		return 0;
 
-	return best >= 0 ? best : lowest;
+	memcpy(cmd, set_curve_cmd_template, sizeof(cmd));
+	cmd[SET_CURVE_CHANNEL_OFFSET] = curve_channel[channel][0];
+	cmd[SET_CURVE_CHANNEL_OFFSET + 1] = curve_channel[channel][1];
+	for (i = 0; i < ARRAY_SIZE(curve_rpm_offsets); i++)
+		put_unaligned_be16(rpm, cmd + curve_rpm_offsets[i]);
+
+	ret = waterforce_write_expanded(priv, cmd, sizeof(cmd));
+	if (ret < 0)
+		return ret;
+
+	msleep(CMD_GAP_MS);
+
+	ret = waterforce_send_profile_code(priv, channel, PROFILE_CODE_CUSTOM);
+	if (ret < 0)
+		return ret;
+
+	priv->active_profile[channel] = PROFILE_CUSTOM;
+	priv->target_rpm[channel] = rpm;
+	priv->profile_sent[channel] = true;
+	waterforce_invalidate_status(priv);
+	return 0;
 }
 
+static unsigned int waterforce_min_rpm(int channel)
+{
+	return min_t(unsigned int, channel ? READ_ONCE(pump_min_rpm) : READ_ONCE(fan_min_rpm),
+		     CURVE_RPM_LIMIT);
+}
+
+static unsigned int waterforce_max_rpm(int channel)
+{
+	return channel ? READ_ONCE(pump_max_rpm) : READ_ONCE(fan_max_rpm);
+}
+
+static int waterforce_set_rpm(struct waterforce_data *priv, int channel, long rpm)
+{
+	int ret;
+
+	rpm = clamp_val(rpm, waterforce_min_rpm(channel), CURVE_RPM_LIMIT);
+
+	mutex_lock(&priv->control_lock);
+	ret = waterforce_apply_rpm(priv, channel, rpm);
+	if (!ret)
+		priv->pwm_mode[channel] = PWM_MODE_MANUAL;
+	mutex_unlock(&priv->control_lock);
+
+	return ret;
+}
+
+/*
+ * pwm 0-254 maps linearly onto 0..max RPM for that channel, raised to the
+ * minimum and capped below the custom-mode limit. pwm 255 selects the max
+ * profile, which is the only way to get full speed.
+ */
 static int waterforce_set_pwm(struct waterforce_data *priv, int channel, long val)
 {
 	int ret;
@@ -284,8 +389,12 @@ static int waterforce_set_pwm(struct waterforce_data *priv, int channel, long va
 	if (val < 0 || val > 255)
 		return -EINVAL;
 
+	if (val < 255)
+		return waterforce_set_rpm(priv, channel,
+					  DIV_ROUND_CLOSEST(val * waterforce_max_rpm(channel), 255));
+
 	mutex_lock(&priv->control_lock);
-	ret = waterforce_apply_profile(priv, channel, waterforce_profile_for_pwm(channel, val));
+	ret = waterforce_apply_profile(priv, channel, channel_profiles[channel].max_idx);
 	if (!ret)
 		priv->pwm_mode[channel] = PWM_MODE_MANUAL;
 	mutex_unlock(&priv->control_lock);
@@ -301,7 +410,7 @@ static int waterforce_set_pwm_mode(struct waterforce_data *priv, int channel, lo
 		return -EINVAL;
 
 	mutex_lock(&priv->control_lock);
-	/* Manual keeps the current profile until the next pwm write */
+	/* Manual keeps the current setting until the next pwm write */
 	if (mode == PWM_MODE_AUTO)
 		ret = waterforce_apply_profile(priv, channel, priv->auto_profile[channel]);
 	if (!ret)
@@ -320,6 +429,11 @@ static int waterforce_read(struct device *dev, enum hwmon_sensor_types type,
 	/* Kept by the driver, so the device need not be queried */
 	if (type == hwmon_pwm && attr == hwmon_pwm_enable) {
 		*val = priv->pwm_mode[channel];
+		return 0;
+	}
+	if (type == hwmon_fan && attr == hwmon_fan_target) {
+		*val = priv->active_profile[channel] == PROFILE_CUSTOM ?
+		       priv->target_rpm[channel] : 0;
 		return 0;
 	}
 
@@ -354,6 +468,9 @@ static int waterforce_write(struct device *dev, enum hwmon_sensor_types type,
 			    u32 attr, int channel, long val)
 {
 	struct waterforce_data *priv = dev_get_drvdata(dev);
+
+	if (type == hwmon_fan && attr == hwmon_fan_target)
+		return waterforce_set_rpm(priv, channel, val);
 
 	if (type != hwmon_pwm)
 		return -EOPNOTSUPP;
@@ -398,6 +515,8 @@ static ssize_t profile_show(struct device *dev, struct device_attribute *attr, c
 	for (i = 0; i < channel_profiles[ch].count; i++)
 		len += sysfs_emit_at(buf, len, i == priv->active_profile[ch] ? "[%s] " : "%s ",
 				     channel_profiles[ch].list[i].name);
+	if (priv->active_profile[ch] == PROFILE_CUSTOM)
+		len += sysfs_emit_at(buf, len, "[custom %u rpm] ", priv->target_rpm[ch]);
 	if (len)
 		buf[len - 1] = '\n';
 
@@ -470,8 +589,8 @@ static const struct hwmon_channel_info *waterforce_info[] = {
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
-			   HWMON_F_INPUT | HWMON_F_LABEL,
-			   HWMON_F_INPUT | HWMON_F_LABEL),
+			   HWMON_F_INPUT | HWMON_F_LABEL | HWMON_F_TARGET,
+			   HWMON_F_INPUT | HWMON_F_LABEL | HWMON_F_TARGET),
 	HWMON_CHANNEL_INFO(pwm,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
@@ -681,4 +800,4 @@ module_exit(waterforce_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Aleksa Savic <savicaleksa83@gmail.com>");
 MODULE_DESCRIPTION("Hwmon driver for Gigabyte AORUS Waterforce AIO coolers, with fan and pump control");
-MODULE_VERSION("1.2.0-control");
+MODULE_VERSION("1.3.0-control");

@@ -12,45 +12,50 @@ before. The difference is that Fan speed and Pump speed can now be controlled.
 
 ## How control works
 
-The cooler has no working "set exact speed" command. The fixed-RPM command
-(`0xE6`) used by earlier drivers is ignored by the firmware. Testing on an X360
-showed that neither the pump nor the fan reacted to it.
+Two kinds of control, both confirmed on an X360:
 
-What does work is choosing one of the cooler's **built-in profiles** (commands
-`0xE5` + `0xB6`, from
-[omarchy-aorus-fan](https://github.com/D05Col/omarchy-aorus-fan)):
+**Fixed speed (custom mode).** Writing `pwmN` or `fanN_target` sends a flat
+custom curve (`0xE6`) and switches that channel to custom mode (profile code
+`0x01`, applied with `0xB6`). The `0xE6` command alone is ignored. It only
+takes effect in custom mode. This allows speeds below every built-in profile,
+for example fan 1000 RPM (~40 %) and pump 2000 RPM (~62 %).
 
-| Channel | Profile | Duty at idle | `pwm` range that selects it |
+* `pwmN` 0–254 maps linearly to 0 – `fan_max_rpm` / `pump_max_rpm`, raised
+  to the minimum (`fan_min_rpm` 750, `pump_min_rpm` 1500).
+* The cooler leaves custom mode at 2800 RPM or more, so fixed speeds stop at
+  2799 RPM. That limits the pump to about 85 %. `pwmN = 255` selects the `max`
+  profile for full speed instead.
+
+**Built-in profiles.** `fan_profile` / `pump_profile` pick one of the cooler's
+own temperature curves (`0xE5` + `0xB6`). Duty measured at 26 °C coolant:
+
+| Fan profile | Duty | Pump profile | Duty |
 |---|---|---|---|
-| Fan | quiet | ~56 % | 0–143 |
-| Fan | balance | ~72 % | 144–184 |
-| Fan | performance | ~88 % | 185–224 |
-| Fan | max | 100 % | 225–255 |
-| Pump | balance | ~81 % (~2670 RPM) | 0–207 |
-| Pump | max | 100 % (~3280 RPM) | 208–255 |
+| zero | fan stop | silent | ~63 % (~2100 RPM) |
+| quiet | ~56 % | quiet | ~66 % (~2140 RPM) |
+| balance | ~72 % | balance | ~81 % (~2650 RPM) |
+| performance | ~88 % | high | ~93 % (~2980 RPM) |
+| max / default | 100 % | max | 100 % (~3250 RPM) |
 
-When `pwmN` is written, the driver picks the **lowest profile that is at least
-as fast as the requested duty**, so the cooler never runs slower than asked.
-That makes the control steps coarse: 4 steps for the fan and 2 for the pump.
-The profiles are themselves temperature curves inside the cooler, so the real
-duty rises with coolant temperature.
+A command is only sent when the setting changes, so the frequent `pwm` writes
+from CoolerControl do not keep sending commands to the cooler.
 
 ## sysfs files
 
 | File | Access | Meaning |
 |---|---|---|
-| `pwm1` / `pwm2` | rw | Read: duty the cooler reports. Write 0–255: picks a profile from the table above (manual mode) |
-| `pwm1_enable` / `pwm2_enable` | rw | `1` = manual (`pwmN` writes pick the profile), `2` = use the profile named in `fan_profile` / `pump_profile` |
+| `pwm1` / `pwm2` | rw | Read: duty the cooler reports. Write 0–255: fixed speed (manual mode) |
+| `fan1_target` / `fan2_target` | rw | Fixed speed in RPM (manual mode). Reads 0 when a profile is active |
+| `pwm1_enable` / `pwm2_enable` | rw | `1` = manual, `2` = use the profile named in `fan_profile` / `pump_profile` |
 | `fan_profile` | rw | `zero quiet balance performance max default`, active one in `[brackets]` |
-| `pump_profile` | rw | `balance max` |
-
-`zero` (fan stop) and `default` (same as max on the tested unit) can only be
-chosen through `fan_profile`, never through `pwm1`. A profile is only sent when
-it changes, so the frequent `pwm` writes from CoolerControl do not keep sending
-commands to the cooler.
+| `pump_profile` | rw | `silent quiet balance high max` |
 
 The existing read-only files (`fan1_input`, `fan2_input`, `temp1_input`,
 labels) behave as before.
+
+Module parameters (also writable at runtime in
+`/sys/module/gigabyte_waterforce/parameters/`): `fan_min_rpm=750`,
+`fan_max_rpm=2600`, `pump_min_rpm=1500`, `pump_max_rpm=3300`.
 
 ## Install (DKMS, survives kernel updates)
 
@@ -59,23 +64,23 @@ CachyOS / Arch:
 ```sh
 sudo pacman -S --needed dkms base-devel linux-cachyos-headers   # headers for your kernel
 sudo pacman -S --needed clang llvm lld   # CachyOS kernels are built with clang; the Makefile detects it
-sudo mkdir -p /usr/src/gigabyte_waterforce-1.1.0
-sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.1.0/
-sudo dkms install gigabyte_waterforce/1.1.0
+sudo mkdir -p /usr/src/gigabyte_waterforce-1.3.0
+sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.3.0/
+sudo dkms install gigabyte_waterforce/1.3.0
 
 # swap the running module for the new one (or just reboot)
 sudo modprobe -r gigabyte_waterforce && sudo modprobe gigabyte_waterforce
-modinfo gigabyte_waterforce | grep version    # should print 1.1.0-control
+cat /sys/module/gigabyte_waterforce/version   # should print 1.3.0-control
 ```
 
 DKMS installs into `updates/`, which takes priority over the in-kernel module.
-If an older version was installed, remove it first with
-`sudo dkms remove gigabyte_waterforce/1.0.0 --all`.
+If an older version was installed, remove it first, for example
+`sudo dkms remove gigabyte_waterforce/1.1.0 --all` (`dkms status` lists them).
 
 ### Quick test without installing
 
 ```sh
-make load      # builds, unloads the stock module, loads this one until reboot
+make load      # builds (add LLVM=1 on clang kernels if the Makefile misses it),, unloads the stock module, loads this one until reboot
 sudo ./test-pump.sh
 ```
 
@@ -86,10 +91,11 @@ sudo ./test-pump.sh
 ```sh
 cd $(grep -l '^waterforce$' /sys/class/hwmon/*/name | xargs dirname)
 
-echo max     | sudo tee pump_profile   # pump to max
-echo quiet   | sudo tee fan_profile    # quiet fan curve
-echo 255     | sudo tee pwm2           # same as pump max, manual mode
-cat fan_profile                        # zero [quiet] balance performance max default
+echo 1000    | sudo tee fan1_target    # fan fixed at ~1000 RPM
+echo 1800    | sudo tee fan2_target    # pump fixed at ~1800 RPM
+echo 120     | sudo tee pwm1           # fan ~47 %
+echo quiet   | sudo tee fan_profile    # back to a built-in fan curve
+cat pump_profile                       # silent quiet balance high max [custom 1800 rpm]
 ```
 
 Allow a couple of seconds after a change before reading `fanN_input`. The
@@ -99,9 +105,8 @@ reading is cached for 2 s.
 
 After the module is loaded, restart the daemon
 (`sudo systemctl restart coolercontrold`). Fan speed and Pump speed then show
-as controllable. A fixed speed or a curve works, but the result snaps to the
-profile steps in the table above. For example, any pump setting up to 81 % gives
-"balance" and anything above gives "max".
+as controllable, across the full range. Pump settings between ~85 % and
+99 % run at the 2799 RPM cap; 100 % switches to the max profile.
 
 ## Notes and known gaps
 
