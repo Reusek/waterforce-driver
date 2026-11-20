@@ -43,6 +43,7 @@ CachyOS / Arch:
 
 ```sh
 sudo pacman -S --needed dkms base-devel linux-cachyos-headers   # headers for your kernel
+sudo pacman -S --needed clang llvm lld   # CachyOS kernels are built with clang; the Makefile detects it
 sudo mkdir -p /usr/src/gigabyte_waterforce-1.0.0
 sudo cp gigabyte_waterforce.c Makefile dkms.conf /usr/src/gigabyte_waterforce-1.0.0/
 sudo dkms install gigabyte_waterforce/1.0.0
