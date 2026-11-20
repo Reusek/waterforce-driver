@@ -20,9 +20,9 @@ show() {
 	sleep 6
 	printf '%-22s pump=%5s rpm pwm2=%3s [%s]  fan=%5s rpm pwm1=%3s [%s]\n' "$1" \
 		"$(cat $hw/fan2_input)" "$(cat $hw/pwm2)" \
-		"$(grep -o '\[[a-z]*\]' $hw/pump_profile | tr -d '[]')" \
+		"$(grep -o '\[[^]]*\]' $hw/pump_profile | tr -d '[]')" \
 		"$(cat $hw/fan1_input)" "$(cat $hw/pwm1)" \
-		"$(grep -o '\[[a-z]*\]' $hw/fan_profile | tr -d '[]')"
+		"$(grep -o '\[[^]]*\]' $hw/fan_profile | tr -d '[]')"
 }
 
 try() {	# try <file> <value>
@@ -34,12 +34,17 @@ echo "coolant: $(( $(cat $hw/temp1_input) / 1000 )) C"
 show "baseline"
 echo "-- pump through pwm2 (what CoolerControl uses)"
 try pwm2 255
-try pwm2 100
+try pwm2 200
+try pwm2 160
+try pwm2 120
 echo "-- fan through pwm1"
-try pwm1 100
-try pwm1 200
 try pwm1 255
-try pwm1 160
+try pwm1 180
+try pwm1 100
+try pwm1 60
+echo "-- exact RPM"
+try fan1_target 1200
+try fan2_target 1800
 
 echo "== restoring automatic control"
 echo balance > "$hw/pump_profile"
