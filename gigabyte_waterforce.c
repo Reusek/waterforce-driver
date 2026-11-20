@@ -56,9 +56,8 @@ static const u8 commit_cmd[] = { 0x99, 0xB6 };
 /*
  * Firmware profiles. pwm is the duty the device reports while the profile is
  * active at idle coolant temperature (0-255), or 0 if a pwm write must never
- * pick it. A pwm write selects the lowest profile whose pwm is at least the
- * requested value, so the cooler never runs below what was asked for.
- * Profiles are listed in increasing pwm order for that search.
+ * pick it. A pwm write selects the fastest profile whose pwm does not exceed
+ * the requested value, so the cooler never runs above what was asked for.
  */
 struct waterforce_profile {
 	const char *name;
@@ -257,22 +256,25 @@ static int waterforce_apply_profile(struct waterforce_data *priv, int channel, i
 	return 0;
 }
 
-/* Lowest pwm-selectable profile that runs at least at the requested duty */
+/*
+ * Fastest pwm-selectable profile that does not exceed the requested duty.
+ * Requests below the slowest profile get the slowest one.
+ */
 static int waterforce_profile_for_pwm(int channel, long pwm)
 {
 	const struct waterforce_profile *list = channel_profiles[channel].list;
-	int i, best = -1;
+	int i, best = -1, lowest = -1;
 
 	for (i = 0; i < channel_profiles[channel].count; i++) {
 		if (!list[i].pwm)
 			continue;
-		if (best < 0 || list[i].pwm > list[best].pwm)
-			best = i;	/* fallback: the highest one */
-		if (list[i].pwm >= pwm)
-			return i;
+		if (lowest < 0 || list[i].pwm < list[lowest].pwm)
+			lowest = i;
+		if (list[i].pwm <= pwm && (best < 0 || list[i].pwm > list[best].pwm))
+			best = i;
 	}
 
-	return best;
+	return best >= 0 ? best : lowest;
 }
 
 static int waterforce_set_pwm(struct waterforce_data *priv, int channel, long val)
@@ -679,4 +681,4 @@ module_exit(waterforce_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Aleksa Savic <savicaleksa83@gmail.com>");
 MODULE_DESCRIPTION("Hwmon driver for Gigabyte AORUS Waterforce AIO coolers, with fan and pump control");
-MODULE_VERSION("1.1.0-control");
+MODULE_VERSION("1.2.0-control");
