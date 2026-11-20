@@ -7,7 +7,7 @@ hw=$(grep -l '^waterforce$' /sys/class/hwmon/*/name 2>/dev/null | head -1 | xarg
 [ -n "$hw" ] || { echo "waterforce hwmon device not found"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
-echo "== module: $(modinfo -F version gigabyte_waterforce 2>/dev/null)  hwmon: $hw"
+echo "== loaded module: $(cat /sys/module/gigabyte_waterforce/version 2>/dev/null)  hwmon: $hw"
 
 cc_was_active=0
 if systemctl is-active -q coolercontrold; then
